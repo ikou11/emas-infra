@@ -10,6 +10,7 @@
 | [docs/02-v1-interface-spec.md](docs/02-v1-interface-spec.md) | 接口与契约：数据模型、事件、动作语义表、闸门、异步控制、查询工具、配置 |
 | [docs/03-emos-capability-audit.md](docs/03-emos-capability-audit.md) | EMOS 能力审查，以及真实失败案例 |
 | [docs/04-emos-trace-recorder.md](docs/04-emos-trace-recorder.md) | EMOS 只读录制器和运行目录约定 |
+| [docs/05-emos-closed-loop.md](docs/05-emos-closed-loop.md) | EMOS 闭环联调：实现方式、验证结果、第一轮运行结果、新发现的 EMOS 问题 |
 
 ## 代码结构
 
@@ -62,8 +63,10 @@ decision = infra.gate(proposed)   # 动作执行前询问闸门：allow / deny /
 - [x] EMOS 只读录制器，以及 4 条真实轨迹（已复制到 `tests/fixtures/traces/`；其中 1 条成功、3 条分别以不同方式失败）
 - [x] 技术选型：进程内运行、同步总线、事件溯源加内存世界状态、动作语义表、规则监工
 - [x] infra 骨架、回放式 mock、30 个测试（包括 4 条真实轨迹上的黄金测试）
-- [ ] 脚本式 mock（闭环：被拒绝之后走另一条分支）
-- [ ] EMOS 适配器：闸门、注入消息、打断（基于 `message_pipe` 和 `get_termination`），进入联调
+- [x] EMOS 适配器：闸门、注入消息、打断（EMOS 分支 `infra-integration`），闭环跑通，并有 7 项集成测试
+- [ ] `stalled_action` 规则，以及向空闲且有能力的队友发求助提示（见 docs/05 §5）
 - [ ] 讨论阶段的查询工具接入 EMOS
+- [ ] 小规模的开启/关闭 infra 对比
+- [ ] 脚本式 mock（真实闭环已经可以跑，优先级降低）
 
-已知缺口：v1 规则抓不到"某个动作一直不结束"的情况，例如 episode 1 中的 `reset_arm`，见 docs/03 §3.1。
+已知缺口：v1 规则抓不到"某个动作一直不结束"的情况，见 docs/05 §5。EMOS 自身的问题 E1（`reset_arm` 超时会结束整个 episode），见 docs/05 §4。

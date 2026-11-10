@@ -116,7 +116,11 @@ def main(argv):
     paths = []
     for a in argv:
         p = Path(a)
-        paths += sorted(p.glob("episode_*.jsonl")) if p.is_dir() else [p]
+        if p.is_dir():
+            # infra output records (*.infra.jsonl) are not adapter event streams
+            paths += sorted(x for x in p.glob("episode_*.jsonl") if not x.name.endswith(".infra.jsonl"))
+        else:
+            paths.append(p)
     if not paths:
         print(__doc__)
         return 2
