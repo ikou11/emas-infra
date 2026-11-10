@@ -1,0 +1,43 @@
+# EMOS adapter profile: the action semantics table and capability tags for EMOS.
+#
+# This file belongs to the EMOS *adapter*, not to infra: infra only interprets it.
+# The EMOS trace recorder emits the same table in `agent.registered`; this copy is
+# used by the replay mock to enrich traces recorded before that (schema 0.1 traces
+# without `semantics` / `capability_tags` / `goal.conditions`).
+
+action_space:
+  - name: nav_to_obj
+    params: {target_obj: entity_id}
+    semantics:
+      post: ["pred(robot_at, args.target_obj, agent.id)"]
+  - name: pick
+    params: {target_obj: entity_id}
+    semantics:
+      requires: [manipulation]
+      pre: ["agent.holding == null"]
+      post: ["agent.holding == args.target_obj"]
+  - name: place
+    params: {target_obj: entity_id, target_location: entity_id}
+    semantics:
+      requires: [manipulation]
+      pre: ["agent.holding == args.target_obj"]
+      post: ["agent.holding == null", "pred(at, args.target_obj, args.target_location)"]
+  - name: reset_arm
+    params: {}
+    semantics:
+      requires: [manipulation]
+  - name: wait
+    params: {}
+    semantics:
+      idle: true
+  - name: send_request
+    params: {request: text, target_agent: agent_id}
+    semantics: {}
+
+# capability tags per embodiment (the resume alone is ambiguous: the drone's
+# resume has a `manipulation` key with an empty workspace)
+embodiment_tags:
+  SpotRobot: [mobility, perception, manipulation]
+  FetchRobot: [mobility, perception, manipulation]
+  StretchRobot: [mobility, perception, manipulation]
+  DJIDrone: [mobility, perception]
