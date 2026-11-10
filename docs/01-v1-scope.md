@@ -47,6 +47,8 @@ Embodied Infra（下文简称 infra）是位于"具身多 agent 系统（EMAS，
 | `outcome_failure` | 动作结束后，动作语义表中的 `post` 条件不成立（例如 pick 结束了，手里却没有目标物体） | 语义表 + 快照 | 注入提示（告诉 agent 上一个动作实际上失败了） |
 | `repeat_failure` | 同一 agent 对同一目标连续 N 次以失败或超时结束 | 动作历史 | 注入提示 |
 | `idle_deadlock` | 所有 agent 同时处于 wait 状态，且任务尚未完成 | agent 状态 + 任务状态 | 打断 wait 并注入提示 |
+| `stalled_action`（v1.1） | 动作运行步数超过语义表中的 `max_steps` | 动作记录 + 当前步数 | 打断并注入提示，每个动作只触发一次 |
+| `help_routing`（v1.1） | 由其他规则的发现触发（默认是 `repeat_failure`、`capability`、`stalled_action`）：找出**空闲**、拥有该动作、且 `capability_tags` 覆盖 `requires` 的队友 | 发现 + agent 状态 + 语义表 | 打断该队友的空闲动作，并注入"谁卡在了什么上、你可以接手" |
 
 "失败"的判定：动作结束后，infra 用适配器提供的**动作语义表**（接口文档 §3.3.1）中的 `post` 条件，对照下一条快照推断结果。`precondition`、`capability` 两条规则也由同一张表驱动。因此所有规则都不写死任何 EMAS 的动作名，这是 infra 可迁移性的基础。
 

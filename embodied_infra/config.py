@@ -26,7 +26,8 @@ class SupervisorCfg(BaseModel):
     enabled: bool = True
     rules: List[str] = Field(default_factory=lambda: [
         "unknown_action", "unknown_entity", "capability", "precondition",
-        "outcome_failure", "repeat_failure", "idle_deadlock"])
+        "outcome_failure", "repeat_failure", "idle_deadlock", "stalled_action",
+        "help_routing"])
     rule_params: Dict[str, Dict[str, Any]] = Field(default_factory=lambda: {"repeat_failure": {"n": 2}})
 
 

@@ -7,7 +7,8 @@ Processing order for every adapter event (synchronous, deterministic):
        action.proposed -> gate rules -> GateDecision (kept until `gate()` is called)
        action.ended    -> remember for outcome inference
        state.snapshot  -> infer outcomes from `post` conditions -> outcome rules
-       any event       -> event rules (e.g. idle_deadlock)
+       any event       -> event rules (e.g. idle_deadlock, stalled_action)
+     findings        -> finding rules (help_routing), one level deep
      async findings -> policy -> Commands -> adapter.control()
 Every finding / decision / command is written to the infra trace.
 """
@@ -154,6 +155,7 @@ class InfraRuntime(InfraClient):
             self.findings.append(f)
             self._record(ev.INFRA_FINDING, f.model_dump(), f.agent_id)
         decision, log = self.policy.decide_gate(fs)
+        self._dispatch_async(self._derived(fs), derive=False)
         aid = e.data.get("action_id")
         self._decisions[aid] = decision
         if fs or decision.decision != "allow":
@@ -171,7 +173,16 @@ class InfraRuntime(InfraClient):
                 fs += self._run_rule(r, "on_outcome", rec, outcome, detail, self.world)
         self._dispatch_async(fs)
 
-    def _dispatch_async(self, fs: List[Finding]) -> None:
+    def _derived(self, fs: List[Finding]) -> List[Finding]:
+        out: List[Finding] = []
+        if fs:
+            for r in self.rules:
+                out += self._run_rule(r, "on_findings", fs, self.world)
+        return out
+
+    def _dispatch_async(self, fs: List[Finding], derive: bool = True) -> None:
+        if derive:
+            fs = fs + self._derived(fs)
         if not fs:
             return
         for f in fs:

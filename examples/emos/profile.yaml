@@ -10,6 +10,7 @@ action_space:
     params: {target_obj: entity_id}
     semantics:
       post: ["pred(robot_at, args.target_obj, agent.id)"]
+      max_steps: 300          # stalled_action; normal runs take <= ~190 steps
   - name: pick
     params: {target_obj: entity_id}
     semantics:
@@ -26,6 +27,7 @@ action_space:
     params: {}
     semantics:
       requires: [manipulation]
+      max_steps: 150          # safety net; EMOS itself times out at 100
   - name: wait
     params: {}
     semantics:

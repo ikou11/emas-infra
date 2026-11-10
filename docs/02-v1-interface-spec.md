@@ -156,6 +156,7 @@ infra 自己会往追踪里写入 `intervention.issued` 和 `control.ack`（见 
 | `pre` | 条件列表（与） | `precondition` 规则：在 `action.proposed` 时，对照当前世界状态检查 |
 | `post` | 条件列表（与） | 结果推断：在 `action.ended` 之后的**下一条快照**上检查。全部成立判为 `success`，否则判为 `failure`。没有 `post` 时判为 `n/a` |
 | `idle` | bool | 标记这是一个"空闲"动作，供 `idle_deadlock` 规则使用 |
+| `max_steps` | int，MAY | `stalled_action` 规则：动作运行超过这么多步仍未结束，就判为卡住。`idle` 动作不检查。需要适配器有一个时间基准，即任何带 `step` 的事件都行；建议定期发 `state.snapshot`（EMOS 中开启 infra 时默认每 25 步一次） |
 
 条件的语法很小，没有 `eval`：
 

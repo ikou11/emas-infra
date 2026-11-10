@@ -27,6 +27,10 @@ class Rule:
                    world: WorldState) -> List[Finding]:
         return []
 
+    def on_findings(self, findings: List[Finding], world: WorldState) -> List[Finding]:
+        """React to other rules' findings (one level deep: the output is not fed back)."""
+        return []
+
     def reset(self) -> None:
         pass
 
@@ -182,7 +186,22 @@ class RepeatFailureRule(Rule):
 
 
 class IdleDeadlockRule(Rule):
+    """All agents idle while the goal is unmet.
+
+    `max_alarms_per_state`: alarms for the same set of unmet goal conditions.
+    If the agents were already told and made no progress, repeating the same
+    hint only costs LLM calls (seen on EMOS perception tasks the agents cannot
+    complete).
+    """
     name = "idle_deadlock"
+
+    def __init__(self, max_alarms_per_state: int = 2, **params):
+        super().__init__(**params)
+        self.max_alarms = int(max_alarms_per_state)
+        self._alarms: Dict[frozenset, int] = {}
+
+    def reset(self):
+        self._alarms = {}
 
     def on_event(self, event, world):
         if event.type != ev.ACTION_STARTED or not world.agents:
@@ -197,6 +216,10 @@ class IdleDeadlockRule(Rule):
                 return []
             idle.append(agent.agent_id)
         unmet = world.unmet_goal_conditions()
+        key = frozenset(unmet)
+        if self.max_alarms > 0 and self._alarms.get(key, 0) >= self.max_alarms:
+            return []
+        self._alarms[key] = self._alarms.get(key, 0) + 1
         return [Finding(rule=self.name, phase="async", step=event.step, agent_id=a,
                         action_id=world.agents[a].current_action,
                         message=(f"All agents are idle but the task is not finished. "
@@ -205,9 +228,113 @@ class IdleDeadlockRule(Rule):
                 for a in idle]
 
 
+class StalledActionRule(Rule):
+    """An action has been running longer than its declared `max_steps`.
+
+    Needs a time base: any event carries `step`, so periodic `state.snapshot`
+    events (or any other agent's activity) are enough to notice a stall.
+    """
+    name = "stalled_action"
+
+    def __init__(self, **params):
+        super().__init__(**params)
+        self._fired: set = set()
+
+    def reset(self):
+        self._fired = set()
+
+    def on_event(self, event, world):
+        out = []
+        for agent in world.agents.values():
+            rec = world.actions.get(agent.current_action) if agent.current_action else None
+            if rec is None or rec.started_step is None or rec.action_id in self._fired:
+                continue
+            spec = agent.action_space.get(rec.name)
+            limit = spec.semantics.get("max_steps") if spec else None
+            if not limit or spec.semantics.get("idle"):
+                continue
+            running = event.step - rec.started_step
+            if running <= int(limit):
+                continue
+            self._fired.add(rec.action_id)
+            out.append(Finding(
+                rule=self.name, phase="async", step=event.step, agent_id=agent.agent_id,
+                action_id=rec.action_id,
+                message=(f"Your action '{rec.name}({_args_text(rec.args)})' has been running for "
+                         f"{running} steps (normally at most {limit}) and is being stopped; the "
+                         f"target may be unreachable for you. Choose a different approach or "
+                         f"ask a teammate for help."),
+                evidence={"running_steps": running, "max_steps": limit}))
+        return out
+
+
+def _is_idle(agent, world: WorldState) -> bool:
+    rec = world.actions.get(agent.current_action) if agent.current_action else None
+    if rec is None:
+        return True
+    spec = agent.action_space.get(rec.name)
+    return bool(spec and spec.semantics.get("idle"))
+
+
+class HelpRoutingRule(Rule):
+    """When an agent is stuck, tell idle teammates that are able to do the job.
+
+    Generic: helpers are chosen by the semantics table (`requires`) and the
+    declared `capability_tags`; infra does not assign the task, it only routes
+    the information "X is stuck on Y and you could do it".
+    """
+    name = "help_routing"
+
+    def __init__(self, triggers: Optional[List[str]] = None, **params):
+        super().__init__(**params)
+        self.triggers = set(triggers or ["repeat_failure", "capability", "stalled_action"])
+        self._sent: set = set()
+
+    def reset(self):
+        self._sent = set()
+
+    def on_findings(self, findings, world):
+        out = []
+        for f in findings:
+            if f.rule not in self.triggers or f.agent_id is None:
+                continue
+            rec = world.actions.get(f.action_id) if f.action_id else None
+            name = (rec.proposed_name if f.phase == "gate" else rec.name) if rec else None
+            args = (rec.proposed_args if f.phase == "gate" else rec.args) if rec else None
+            requester = world.agents.get(f.agent_id)
+            if name is None or requester is None:
+                continue
+            spec = requester.action_space.get(name)
+            need = (spec.semantics.get("requires") if spec else None) or []
+            for helper in world.agents.values():
+                if helper.agent_id == f.agent_id or name not in helper.action_space:
+                    continue
+                if need and (helper.capability_tags is None
+                             or any(t not in helper.capability_tags for t in need)):
+                    continue
+                if not _is_idle(helper, world):
+                    continue
+                key = (f.agent_id, name, _args_text(args), helper.agent_id)
+                if key in self._sent:
+                    continue
+                self._sent.add(key)
+                unmet = world.unmet_goal_conditions()
+                out.append(Finding(
+                    rule=self.name, phase="async", step=f.step, agent_id=helper.agent_id,
+                    action_id=f.action_id,
+                    message=(f"Teammate {f.agent_id} ({requester.embodiment}) is stuck: cannot "
+                             f"complete '{name}({_args_text(args)})' ({f.rule}). You are idle "
+                             f"and able to do '{name}'. Consider taking over this part of the task"
+                             + (f"; unmet goal conditions: {unmet}." if unmet else ".")),
+                    evidence={"requester": f.agent_id, "trigger": f.rule, "action": name,
+                              "args": args, "requires": need}))
+        return out
+
+
 RULES: Dict[str, Type[Rule]] = {r.name: r for r in [
     UnknownActionRule, UnknownEntityRule, CapabilityRule, PreconditionRule,
     OutcomeFailureRule, RepeatFailureRule, IdleDeadlockRule,
+    StalledActionRule, HelpRoutingRule,
 ]}
 
 

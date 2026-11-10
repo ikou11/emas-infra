@@ -20,6 +20,9 @@ DEFAULT_POLICY: Dict[str, Dict[str, object]] = {
     "outcome_failure": {"inject": True},
     "repeat_failure":  {"inject": True},
     "idle_deadlock":   {"interrupt": True, "inject": True},
+    "stalled_action":  {"interrupt": True, "inject": True},
+    # helpers are idle (e.g. in a long wait): interrupt so they read the hint now
+    "help_routing":    {"interrupt": True, "inject": True},
 }
 
 MESSAGE_PREFIX = "[Supervisor]"

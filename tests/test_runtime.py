@@ -174,5 +174,98 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(any(r["type"] == "tool.called" for r in rt.records))
 
 
+def start(rt, f, n, agent, name, args, step):
+    rt.emit(f("action.proposed", {"action_id": f"{agent}:{n}", "name": name, "args": args},
+              agent_id=agent, source="agent_report", step=step))
+    rt.emit(f("action.started", {"action_id": f"{agent}:{n}", "name": name, "args": args},
+              agent_id=agent, step=step))
+
+
+def end(rt, f, n, agent, step, status="completed"):
+    rt.emit(f("action.ended", {"action_id": f"{agent}:{n}", "status": status},
+              agent_id=agent, step=step))
+
+
+class StalledAndHelpTest(unittest.TestCase):
+    def setUp(self):
+        self.rt = InfraRuntime({"enabled": True})
+        self.ad = FakeAdapter()
+        self.rt.attach(self.ad)
+        self.f = EventFactory()
+        start_episode(self.rt, self.f, {"agent_0": ["mobility", "manipulation"],
+                                        "agent_1": ["mobility", "manipulation"],
+                                        "drone": ["mobility", "perception"]})
+        self.rt.emit(snapshot(self.f, {"agent_0": None, "agent_1": None, "drone": None}))
+
+    def cmds(self, agent=None):
+        return [(c.type, c.agent_id) for c in self.ad.cmds if agent in (None, c.agent_id)]
+
+    def test_stalled_nav_interrupted_once(self):
+        start(self.rt, self.f, 1, "agent_0", "nav_to_obj", {"target_obj": "cup"}, 10)
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=300))     # 290 <= 300
+        self.assertEqual(self.cmds("agent_0"), [])
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=320))
+        self.assertEqual(self.cmds("agent_0"), [("interrupt", "agent_0"),
+                                                ("inject_message", "agent_0")])
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=500))     # once per action
+        self.assertEqual(len(self.cmds("agent_0")), 2)
+
+    def test_actions_without_max_steps_or_idle_never_stall(self):
+        start(self.rt, self.f, 1, "agent_0", "wait", {}, 0)
+        start(self.rt, self.f, 1, "agent_1", "send_request", {}, 0)
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=5000))
+        self.assertNotIn("stalled_action", [x.rule for x in self.rt.findings])
+
+    def test_help_routed_to_idle_capable_teammate_only(self):
+        start(self.rt, self.f, 1, "agent_1", "wait", {}, 0)    # idle, capable
+        start(self.rt, self.f, 1, "drone", "wait", {}, 0)      # idle, lacks manipulation
+        for n, s in ((1, 10), (2, 120)):
+            start(self.rt, self.f, n, "agent_0", "pick", {"target_obj": "cup"}, s)
+            end(self.rt, self.f, n, "agent_0", s + 99, "timeout")
+            self.rt.emit(snapshot(self.f, {"agent_0": None}, step=s + 100))
+        rules = [(x.rule, x.agent_id) for x in self.rt.findings]
+        self.assertIn(("repeat_failure", "agent_0"), rules)
+        self.assertIn(("help_routing", "agent_1"), rules)
+        self.assertNotIn(("help_routing", "drone"), rules)
+        self.assertIn(("interrupt", "agent_1"), self.cmds("agent_1"))
+        msg = [c for c in self.ad.cmds if c.type == "inject_message" and c.agent_id == "agent_1"]
+        self.assertIn("agent_0", msg[0].payload["text"])
+
+    def test_busy_teammate_not_disturbed(self):
+        start(self.rt, self.f, 1, "agent_1", "nav_to_obj", {"target_obj": "cup"}, 0)
+        for n, s in ((1, 10), (2, 120)):
+            start(self.rt, self.f, n, "agent_0", "pick", {"target_obj": "cup"}, s)
+            end(self.rt, self.f, n, "agent_0", s + 99, "timeout")
+            self.rt.emit(snapshot(self.f, {"agent_0": None}, step=s + 100))
+        self.assertNotIn("help_routing", [x.rule for x in self.rt.findings])
+
+    def test_capability_denial_routes_help(self):
+        start(self.rt, self.f, 1, "agent_0", "wait", {}, 0)
+        start(self.rt, self.f, 1, "agent_1", "nav_to_obj", {"target_obj": "cup"}, 0)  # busy
+        d = propose(self.rt, self.f, "drone", 1, "pick", {"target_obj": "cup"})
+        self.assertEqual(d.decision, "deny")
+        rules = [(x.rule, x.agent_id) for x in self.rt.findings]
+        self.assertIn(("help_routing", "agent_0"), rules)
+        self.assertNotIn(("help_routing", "agent_1"), rules)
+
+
+class IdleDeadlockRepeatTest(unittest.TestCase):
+    def test_same_unmet_state_alarms_at_most_twice(self):
+        rt = InfraRuntime({"enabled": True, "interventions": {"cooldown_steps": 0,
+                                                               "max_per_agent_episode": 99}})
+        ad = FakeAdapter(); rt.attach(ad); f = EventFactory()
+        start_episode(rt, f, {"agent_0": ["mobility"], "agent_1": ["mobility"]})
+        rt.emit(snapshot(f, {"agent_0": None, "agent_1": None}))
+        n = 0
+        for k in range(5):
+            for a in ("agent_0", "agent_1"):
+                n += 1
+                start(rt, f, n, a, "wait", {}, 100 * k)
+            for a in ("agent_0", "agent_1"):
+                end(rt, f, n - (a == "agent_0"), a, 100 * k + 50, "interrupted")
+        alarms = [x for x in rt.findings if x.rule == "idle_deadlock"]
+        self.assertEqual(len(alarms), 4)  # 2 alarms x 2 agents
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -67,11 +67,15 @@ class ReplayNoFalsePositiveTest(unittest.TestCase):
         self.assertTrue(rt.world.success)
         self.assertEqual(len(rt.bus.errors), 0)
 
-    def test_ep1_known_gap(self):
-        # ep1 fails because reset_arm never terminates and agent_1 only waits.
-        # No v1 rule covers a stalled action; documented in docs/03 §3.1.
+    def test_ep1_stalled_reset_arm(self):
+        # ep1 fails because reset_arm never terminates while agent_1 only waits
+        # (docs/03 §3.1). stalled_action catches it (max_steps 150) and
+        # help_routing tells the idle, capable agent_1.
         rt = replay(trace("emos_fetch_stretch_ep1_fail.jsonl"), PROFILE)
-        self.assertEqual(findings(rt), [])
+        self.assertEqual(findings(rt), [("stalled_action", 499, "agent_0"),
+                                        ("help_routing", 499, "agent_1")])
+        help_ = [f for f in rt.findings if f.rule == "help_routing"][0]
+        self.assertEqual(help_.evidence["requester"], "agent_0")
         self.assertEqual(len(rt.bus.errors), 0)
 
     def test_without_profile_rules_stay_silent(self):

@@ -11,6 +11,7 @@
 | [docs/03-emos-capability-audit.md](docs/03-emos-capability-audit.md) | EMOS 能力审查，以及真实失败案例 |
 | [docs/04-emos-trace-recorder.md](docs/04-emos-trace-recorder.md) | EMOS 只读录制器和运行目录约定 |
 | [docs/05-emos-closed-loop.md](docs/05-emos-closed-loop.md) | EMOS 闭环联调：实现方式、验证结果、第一轮运行结果、新发现的 EMOS 问题 |
+| [docs/06-ablation-round1.md](docs/06-ablation-round1.md) | 第一轮开启/关闭 infra 对比：结果、E2、失败归类、下一步 |
 
 ## 代码结构
 
@@ -62,11 +63,13 @@ decision = infra.gate(proposed)   # 动作执行前询问闸门：allow / deny /
 - [x] EMOS 可行性审查
 - [x] EMOS 只读录制器，以及 4 条真实轨迹（已复制到 `tests/fixtures/traces/`；其中 1 条成功、3 条分别以不同方式失败）
 - [x] 技术选型：进程内运行、同步总线、事件溯源加内存世界状态、动作语义表、规则监工
-- [x] infra 骨架、回放式 mock、30 个测试（包括 4 条真实轨迹上的黄金测试）
+- [x] infra 骨架、回放式 mock、36 个测试（包括 4 条真实轨迹上的黄金测试）
 - [x] EMOS 适配器：闸门、注入消息、打断（EMOS 分支 `infra-integration`），闭环跑通，并有 7 项集成测试
-- [ ] `stalled_action` 规则，以及向空闲且有能力的队友发求助提示（见 docs/05 §5）
+- [x] `stalled_action`、`help_routing` 规则；`idle_deadlock` 限制重复报警
+- [x] 修复 EMOS 底层问题 E1（`reset_arm`）和 E2（`place` 判断完成时看错物体）
+- [x] 小规模开启/关闭 infra 对比：两组成功率相同（各 3/15），详见 docs/06
+- [ ] `help_routing` 在第一次失败时就触发；收紧 `nav_to_obj` 的 `max_steps`（docs/06 §4）
 - [ ] 讨论阶段的查询工具接入 EMOS
-- [ ] 小规模的开启/关闭 infra 对比
 - [ ] 脚本式 mock（真实闭环已经可以跑，优先级降低）
 
-已知缺口：v1 规则抓不到"某个动作一直不结束"的情况，见 docs/05 §5。EMOS 自身的问题 E1（`reset_arm` 超时会结束整个 episode），见 docs/05 §4。
+已知缺口：任务分配本身导致的失败（一个 agent 串行做完所有事，最后超时）infra v1 看不到，见 docs/06 §3。

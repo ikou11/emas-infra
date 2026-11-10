@@ -52,7 +52,12 @@ infra ──control()──► EmosInfraAdapter ──► CrabAgent.message_pipe
 - 技能运行超过 100 步就会触发 `bad_terminate`，整个 episode 判为失败。ep1 中，agent_0 的 `reset_arm` 从 step 229 开始，episode 恰好在 step 329 结束。
 - 再加上 `ResetArmSkill` 本身的问题：`_init_joint_pos` 只在这个技能对象**第一次被调用时**记录一次，之后从不重置；而"完成"的判定是关节回到这个姿态，这往往做不到。
 
-修复方式（待你决定，因为会改变 EMOS 的基线行为）：给 `reset_arm` 加上 `force_end_on_timeout: False`，并在 `on_enter` 中重新记录初始姿态。
+**已修复（2026-11-10）**：
+- `reset_arm` 设置 `force_end_on_timeout: False`；
+- 环境端 `OracleResetArmAction.reset()` 每个 episode 重新记录初始姿态；
+- 技能端改为"关节停止移动即完成"。
+
+另外发现了 E2（`place` 判断完成时看错了物体），见 docs/06 §2。
 
 ## 5. 下一步
 
