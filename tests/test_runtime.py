@@ -188,7 +188,8 @@ def end(rt, f, n, agent, step, status="completed"):
 
 class StalledAndHelpTest(unittest.TestCase):
     def setUp(self):
-        self.rt = InfraRuntime({"enabled": True})
+        self.rt = InfraRuntime({"enabled": True, "supervisor": {
+            "rule_params": {"repeat_failure": {"n": 2}, "stagnation": {"window": 10000}}}})
         self.ad = FakeAdapter()
         self.rt.attach(self.ad)
         self.f = EventFactory()
@@ -202,9 +203,9 @@ class StalledAndHelpTest(unittest.TestCase):
 
     def test_stalled_nav_interrupted_once(self):
         start(self.rt, self.f, 1, "agent_0", "nav_to_obj", {"target_obj": "cup"}, 10)
-        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=300))     # 290 <= 300
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=200))     # 190 <= max_steps 200
         self.assertEqual(self.cmds("agent_0"), [])
-        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=320))
+        self.rt.emit(snapshot(self.f, {"agent_0": None}, step=220))
         self.assertEqual(self.cmds("agent_0"), [("interrupt", "agent_0"),
                                                 ("inject_message", "agent_0")])
         self.rt.emit(snapshot(self.f, {"agent_0": None}, step=500))     # once per action
@@ -232,7 +233,7 @@ class StalledAndHelpTest(unittest.TestCase):
         self.assertIn("agent_0", msg[0].payload["text"])
 
     def test_busy_teammate_not_disturbed(self):
-        start(self.rt, self.f, 1, "agent_1", "nav_to_obj", {"target_obj": "cup"}, 0)
+        start(self.rt, self.f, 1, "agent_1", "nav_to_obj", {"target_obj": "cup"}, 100)
         for n, s in ((1, 10), (2, 120)):
             start(self.rt, self.f, n, "agent_0", "pick", {"target_obj": "cup"}, s)
             end(self.rt, self.f, n, "agent_0", s + 99, "timeout")

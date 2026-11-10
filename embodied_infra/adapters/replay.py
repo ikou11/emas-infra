@@ -58,6 +58,8 @@ def enrich(event: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
         goal = d.setdefault("goal", {}) or {}
         if not goal.get("conditions") and goal.get("expr"):
             goal["conditions"] = split_and_goal(goal["expr"])
+        if d.get("max_steps") is None and profile.get("max_steps"):
+            d["max_steps"] = int(profile["max_steps"])
     elif t == "agent.registered":
         if not any(a.get("semantics") for a in d.get("action_space", [])) and \
                 profile.get("action_space"):
@@ -117,6 +119,11 @@ def format_timeline(rt: InfraRuntime) -> str:
             lines.append(f"step {r['step']:>4}  COMMAND   {c['type']:<16} {c.get('agent_id') or '':<8} {c['payload'].get('text', c['payload'].get('reason', ''))}")
         elif t == "action.outcome_inferred" and d["outcome"] in ("success", "failure"):
             lines.append(f"step {r['step']:>4}  OUTCOME   {d['outcome']:<16} {r.get('agent_id') or '':<8} {d['action_id']} {d['name']} ({d['status']})")
+        elif t == "supervisor.llm_decision":
+            calls = "; ".join(f"{c['name']}({json.dumps(c.get('arguments', {}), ensure_ascii=False)})"
+                              for c in d.get("tool_calls", []))
+            lines.append(f"step {r['step']:>4}  LLM       {d['mode']:<16} {d.get('used'):<8} "
+                         f"{d.get('reason') or calls} [{d.get('latency_s', '-')}s]")
         elif t == "infra.warning":
             lines.append(f"step {r['step']:>4}  WARNING   {json.dumps(d, ensure_ascii=False)}")
     return "\n".join(lines)
@@ -127,8 +134,17 @@ def main(argv=None) -> int:
     ap.add_argument("trace")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--out", default=None, help="write infra trace files to this directory")
+    ap.add_argument("--config", default=None, help="infra YAML config (e.g. the EMOS one)")
+    ap.add_argument("--llm", action="store_true",
+                    help="enable the supervisor LLM and all assist options (real API calls)")
     args = ap.parse_args(argv)
-    cfg = {"enabled": True, "trace": {"enabled": bool(args.out), "dir": args.out}}
+    from ..config import load_config
+    cfg = load_config(args.config).model_dump() if args.config else {}
+    cfg.update({"enabled": True, "trace": {"enabled": bool(args.out), "dir": args.out}})
+    if args.llm:
+        sup = cfg.setdefault("supervisor", {})
+        sup.setdefault("llm", {})["enabled"] = True
+        sup["assist"] = {"first_failure_help": True, "workload_balance": True, "plan_review": True}
     rt = replay(args.trace, load_profile(args.profile), cfg)
     w = rt.world
     print(format_timeline(rt))

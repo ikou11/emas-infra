@@ -9,7 +9,10 @@ Processing order for every adapter event (synchronous, deterministic):
        state.snapshot  -> infer outcomes from `post` conditions -> outcome rules
        any event       -> event rules (e.g. idle_deadlock, stalled_action)
      findings        -> finding rules (help_routing), one level deep
-     async findings -> policy -> Commands -> adapter.control()
+     async findings -> policy (cooldown/budget) -> rule-template Commands
+                       escalated rules -> LLM decides the Commands (template = fallback)
+     plan.assigned   -> optional LLM plan review (assist layer)
+   -> adapter.control()
 Every finding / decision / command is written to the infra trace.
 """
 from __future__ import annotations
@@ -20,11 +23,12 @@ from typing import Any, Dict, List, Optional
 from . import events as ev
 from .bus import EventBus
 from .client import EmasAdapter, EventLike, InfraClient
-from .config import InfraConfig, load_config
+from .config import SAFETY_RULES, InfraConfig, load_config
 from .control import Command, ControlAck, GateDecision
 from .events import Event, parse_event
 from .semantics import validate_table
 from .supervisor import Finding, InterventionPolicy, OutcomeInferer, build_rules
+from .supervisor.llm import ChatFn, LLMSupervisor, openai_chat_fn
 from .tools import QueryTools
 from .trace import TraceWriter
 from .world import InMemoryWorldStore
@@ -38,16 +42,26 @@ _COMMAND_SUPPORT = {"inject_message": "inject_message", "interrupt": "interrupt"
 class InfraRuntime(InfraClient):
     enabled = True
 
-    def __init__(self, config: Any = None) -> None:
+    def __init__(self, config: Any = None, llm_chat: Optional[ChatFn] = None) -> None:
+        """`llm_chat` injects the supervisor LLM (tests); by default it is built
+        from the supervisor env file when `supervisor.llm.enabled`."""
         self.cfg: InfraConfig = load_config(config)
         self.store = InMemoryWorldStore(self.cfg.world_model.allowed_sources)
         self.trace = TraceWriter(self.cfg.trace.dir if self.cfg.trace.enabled else None)
         self.inferer = OutcomeInferer()
         sup = self.cfg.supervisor
-        self.rules = build_rules(sup.rules, sup.rule_params) if sup.enabled else []
+        names, params = self._rule_plan()
+        self.rules = build_rules(names, params)
         iv = self.cfg.interventions
         self.policy = InterventionPolicy(iv.policy, iv.allowed, iv.cooldown_steps,
                                          iv.max_per_agent_episode)
+        chat = None
+        if sup.enabled and sup.llm.enabled:
+            chat = llm_chat or openai_chat_fn(sup.llm.env_file, sup.llm.model, sup.llm.timeout_s,
+                                              sup.llm.temperature, sup.llm.max_tokens,
+                                              sup.llm.tool_choice)
+        self.llm = LLMSupervisor(chat, sup.llm.max_calls_per_episode, sup.llm.min_interval_steps,
+                                 [a for a in iv.allowed if a in ("inject_message", "interrupt")])
         self.tools = QueryTools(lambda: self.store.state)
         self.adapter: Optional[EmasAdapter] = None
         self._decisions: Dict[str, GateDecision] = {}
@@ -59,6 +73,20 @@ class InfraRuntime(InfraClient):
         self.bus.subscribe(self.trace.write_input, name="trace")
         self.bus.subscribe(self.store.apply, name="world")
         self.bus.subscribe(self._supervise, name="supervisor")
+
+    def _rule_plan(self):
+        """Safety rules always; correction rules when the supervisor is on; assist
+        rules/options as configured."""
+        sup = self.cfg.supervisor
+        names = list(SAFETY_RULES)
+        params = {k: dict(v) for k, v in sup.rule_params.items()}
+        if sup.enabled:
+            names += [r for r in sup.rules if r not in names]
+            if sup.assist.workload_balance and "workload_risk" not in names:
+                names.append("workload_risk")
+            if sup.assist.first_failure_help:
+                params.setdefault("help_routing", {})["on_first_failure"] = True
+        return names, params
 
     @property
     def world(self):
@@ -119,6 +147,7 @@ class InfraRuntime(InfraClient):
         if e.type == ev.EPISODE_STARTED:
             self.inferer.reset()
             self.policy.reset()
+            self.llm.reset()
             self._decisions.clear()
             for r in self.rules:
                 r.reset()
@@ -137,6 +166,8 @@ class InfraRuntime(InfraClient):
             self.inferer.on_action_ended(e.data.get("action_id"))
         elif e.type == ev.STATE_SNAPSHOT:
             self._infer_outcomes()
+        elif e.type == ev.PLAN_ASSIGNED:
+            self._plan_review()
         elif e.type == ev.CONTROL_ACK:
             self._record("control.ack.received", dict(e.data), e.agent_id)
         elif e.type == ev.EPISODE_ENDED:
@@ -188,13 +219,49 @@ class InfraRuntime(InfraClient):
         for f in fs:
             self.findings.append(f)
             self._record(ev.INFRA_FINDING, f.model_dump(), f.agent_id)
-        cmds, log = self.policy.decide_async(fs)
+        admitted, log = self.policy.admit_async(fs)
+        llm_cfg = self.cfg.supervisor.llm
+        cmds = self.policy.commands_for(admitted)
+        llm_cmds = None
+        if self.llm.available and any(f.rule in set(llm_cfg.escalate) for f in admitted):
+            llm_cmds, rec = self.llm.decide(self.world, admitted, cmds)
+            self._record("supervisor.llm_decision", rec)
+        if llm_cmds is not None:
+            cmds = llm_cmds
+        else:  # rule fallback: drop suggestions that need the LLM's confirmation
+            need = set(llm_cfg.require_confirmation)
+            risky = [f for f in admitted
+                     if f.rule in need and not f.evidence.get("blocked_owner")]
+            if risky:
+                cmds = self.policy.commands_for([f for f in admitted if f not in risky])
+                log += [{"rule": f.rule, "agent_id": f.agent_id, "action": "none",
+                         "reason": "needs llm confirmation"} for f in risky]
+                admitted = [f for f in admitted if f not in risky]
+        for f in admitted:
+            log.append({"rule": f.rule, "agent_id": f.agent_id, "action": "admitted"})
+        self._issue(cmds)
+        if log:
+            self._record("infra.policy", {"log": log})
+
+    def _plan_review(self) -> None:
+        sup = self.cfg.supervisor
+        if not (sup.enabled and sup.assist.plan_review and self.llm.available):
+            return
+        cmds, rec = self.llm.decide(self.world, [], [], mode="plan_review")
+        self._record("supervisor.llm_decision", rec)
+        # plan review only advises; it never interrupts
+        self._issue([c for c in (cmds or []) if c.type == "inject_message"])
+
+    def _issue(self, cmds: List[Command]) -> None:
+        seen = set()
         for cmd in cmds:
+            key = (cmd.type, cmd.agent_id, cmd.payload.get("text"))
+            if key in seen:
+                continue
+            seen.add(key)
             ack = self._send(cmd)
             self._record(ev.INFRA_INTERVENTION, {"command": cmd.model_dump(),
                                                  "ack": ack.model_dump()}, cmd.agent_id)
-        if log:
-            self._record("infra.policy", {"log": log})
 
     def _send(self, cmd: Command) -> ControlAck:
         step = self.world.step

@@ -15,3 +15,6 @@ class Finding(BaseModel):
     action_id: Optional[str] = None
     message: str  # human/LLM readable, used as the injected hint
     evidence: Dict[str, Any] = Field(default_factory=dict)
+    # Per-finding override of the policy's interrupt setting (e.g. inform a busy
+    # agent without stopping it). None = use the policy.
+    interrupt: Optional[bool] = None

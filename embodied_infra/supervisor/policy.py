@@ -23,6 +23,9 @@ DEFAULT_POLICY: Dict[str, Dict[str, object]] = {
     "stalled_action":  {"interrupt": True, "inject": True},
     # helpers are idle (e.g. in a long wait): interrupt so they read the hint now
     "help_routing":    {"interrupt": True, "inject": True},
+    "repeated_denial": {"inject": True},
+    "stagnation":      {"inject": True},
+    "workload_risk":   {"interrupt": True, "inject": True},
 }
 
 MESSAGE_PREFIX = "[Supervisor]"
@@ -91,25 +94,41 @@ class InterventionPolicy:
                             message=self._text(deny) if inject else None,
                             findings=[f.rule for f in deny]), log
 
-    def decide_async(self, findings: List[Finding]) -> Tuple[List[Command], List[dict]]:
-        cmds: List[Command] = []
+    def admit_async(self, findings: List[Finding]) -> Tuple[List[Finding], List[dict]]:
+        """Apply cooldown / budget; admitted findings are committed (counted)."""
+        ok_fs: List[Finding] = []
         log: List[dict] = []
         for f in findings:
-            cfg = self.rules.get(f.rule, {})
             ok, why = self._admit(f)
             if not ok:
                 log.append({"rule": f.rule, "agent_id": f.agent_id, "action": "none", "reason": why})
                 continue
-            issued = []
-            if cfg.get("interrupt") and "interrupt" in self.allowed:
+            if not self.commands_for([f]):
+                log.append({"rule": f.rule, "agent_id": f.agent_id, "action": "none",
+                            "reason": "policy"})
+                continue
+            self._commit(f)
+            ok_fs.append(f)
+        return ok_fs, log
+
+    def commands_for(self, findings: List[Finding]) -> List[Command]:
+        """Rule-template commands for already admitted findings (the LLM fallback)."""
+        cmds: List[Command] = []
+        for f in findings:
+            cfg = self.rules.get(f.rule, {})
+            do_int = cfg.get("interrupt") if f.interrupt is None else f.interrupt
+            if do_int and "interrupt" in self.allowed:
                 cmds.append(Command(type="interrupt", agent_id=f.agent_id,
                                     payload={"reason": f.rule}))
-                issued.append("interrupt")
             if cfg.get("inject") and "inject_message" in self.allowed:
                 cmds.append(Command(type="inject_message", agent_id=f.agent_id,
                                     payload={"text": self._text([f]), "from": "supervisor"}))
-                issued.append("inject_message")
-            if issued:
-                self._commit(f)
-            log.append({"rule": f.rule, "agent_id": f.agent_id, "action": issued or "none"})
+        return cmds
+
+    def decide_async(self, findings: List[Finding]) -> Tuple[List[Command], List[dict]]:
+        admitted, log = self.admit_async(findings)
+        cmds = self.commands_for(admitted)
+        for f in admitted:
+            log.append({"rule": f.rule, "agent_id": f.agent_id,
+                        "action": [c.type for c in self.commands_for([f])]})
         return cmds, log

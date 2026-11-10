@@ -56,8 +56,11 @@ class InMemoryWorldStore(WorldStore):
     def _on_episode_started(self, e: Event, s: WorldState) -> None:
         d = e.data
         s.task_text = d.get("task_text", "")
+        s.scene_text = d.get("scene_text", "") or ""
         goal = d.get("goal") or {}
         s.goal_conditions = goal.get("conditions")
+        if d.get("max_steps") is not None:
+            s.max_steps = int(d["max_steps"])
         for ent in d.get("entities", []):
             s.entities[ent["entity_id"]] = EntityState(
                 entity_id=ent["entity_id"], type=ent.get("type"),

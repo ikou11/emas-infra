@@ -9,3 +9,6 @@ dist/
 runs/
 *.infra.jsonl
 !tests/fixtures/**
+
+# supervisor LLM credentials
+.env

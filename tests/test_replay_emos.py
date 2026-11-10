@@ -97,6 +97,8 @@ class ReplaySendRequestDeadlockTest(unittest.TestCase):
     def test_detects_both_deadlocks_without_profile(self):
         self.assertEqual(findings(self.rt), [
             ("idle_deadlock", 0, "agent_0"), ("idle_deadlock", 0, "agent_1"),
+            # no goal progress for 500 steps (agents blocked in send_request)
+            ("stagnation", 500, "agent_0"), ("stagnation", 500, "agent_1"),
             ("idle_deadlock", 664, "agent_0"), ("idle_deadlock", 664, "agent_1"),
         ])
         self.assertFalse(any(r["type"] == "infra.warning" for r in self.rt.records))

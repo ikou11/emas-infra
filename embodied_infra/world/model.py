@@ -72,7 +72,9 @@ class WorldState(BaseModel):
     episode_id: Optional[str] = None
     step: int = 0
     task_text: str = ""
+    scene_text: str = ""
     goal_conditions: Optional[List[str]] = None
+    max_steps: Optional[int] = None  # episode step budget, if the adapter reports it
     entities: Dict[str, EntityState] = Field(default_factory=dict)
     agents: Dict[str, AgentState] = Field(default_factory=dict)
     actions: Dict[str, ActionRecord] = Field(default_factory=dict)

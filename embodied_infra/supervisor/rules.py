@@ -276,6 +276,21 @@ def _is_idle(agent, world: WorldState) -> bool:
     return bool(spec and spec.semantics.get("idle"))
 
 
+def _entities_in(args: Any) -> List[str]:
+    if not isinstance(args, dict):
+        return []
+    return [v for k, v in args.items() if k != "robot" and isinstance(v, str)]
+
+
+def _failed_on(world: WorldState, agent_id: str, name: str, args: Any) -> bool:
+    """Memory: has this agent already failed `name` on the same entities?"""
+    ents = set(_entities_in(args))
+    for a in world.agent_actions(agent_id):
+        if a.name == name and a.outcome == "failure" and ents and ents <= set(_entities_in(a.args)):
+            return True
+    return False
+
+
 class HelpRoutingRule(Rule):
     """When an agent is stuck, tell idle teammates that are able to do the job.
 
@@ -285,9 +300,13 @@ class HelpRoutingRule(Rule):
     """
     name = "help_routing"
 
-    def __init__(self, triggers: Optional[List[str]] = None, **params):
+    def __init__(self, triggers: Optional[List[str]] = None, on_first_failure: bool = False,
+                 **params):
         super().__init__(**params)
         self.triggers = set(triggers or ["repeat_failure", "capability", "stalled_action"])
+        # assist layer: also route help after the FIRST failure of an action that
+        # needs a capability (semantics `requires`), not only after repeats
+        self.on_first_failure = bool(on_first_failure)
         self._sent: set = set()
 
     def reset(self):
@@ -296,7 +315,10 @@ class HelpRoutingRule(Rule):
     def on_findings(self, findings, world):
         out = []
         for f in findings:
-            if f.rule not in self.triggers or f.agent_id is None:
+            if f.agent_id is None:
+                continue
+            first = self.on_first_failure and f.rule == "outcome_failure"
+            if f.rule not in self.triggers and not first:
                 continue
             rec = world.actions.get(f.action_id) if f.action_id else None
             name = (rec.proposed_name if f.phase == "gate" else rec.name) if rec else None
@@ -306,6 +328,8 @@ class HelpRoutingRule(Rule):
                 continue
             spec = requester.action_space.get(name)
             need = (spec.semantics.get("requires") if spec else None) or []
+            if first and not need:
+                continue  # a failed plain move is not worth involving a teammate
             for helper in world.agents.values():
                 if helper.agent_id == f.agent_id or name not in helper.action_space:
                     continue
@@ -313,6 +337,8 @@ class HelpRoutingRule(Rule):
                              or any(t not in helper.capability_tags for t in need)):
                     continue
                 if not _is_idle(helper, world):
+                    continue
+                if _failed_on(world, helper.agent_id, name, args):
                     continue
                 key = (f.agent_id, name, _args_text(args), helper.agent_id)
                 if key in self._sent:
@@ -331,10 +357,263 @@ class HelpRoutingRule(Rule):
         return out
 
 
+class RepeatedDenialRule(Rule):
+    """The gate keeps rejecting the same agent's proposals (it falls back to waiting).
+
+    Rule templates evidently did not help; escalate (the LLM writes a better hint).
+    """
+    name = "repeated_denial"
+
+    def __init__(self, n: int = 3, **params):
+        super().__init__(**params)
+        self.n = int(n)
+
+    def on_event(self, event, world):
+        if event.type != ev.ACTION_ENDED or event.data.get("status") != "rejected":
+            return []
+        streak = 0
+        last = None
+        for a in reversed(world.agent_actions(event.agent_id)):
+            if a.status == "rejected":
+                streak += 1
+                last = last or a
+            elif a.status is not None:
+                break
+        if streak != self.n:  # fire once per streak
+            return []
+        return [Finding(rule=self.name, phase="async", step=event.step, agent_id=event.agent_id,
+                        action_id=last.action_id if last else None,
+                        message=(f"Your last {streak} proposed actions were all rejected. Re-read the "
+                                 f"rejection reasons and choose an action that is valid now."),
+                        evidence={"streak": streak})]
+
+
+def _goal_progress(world: WorldState) -> Optional[int]:
+    if not world.goal_conditions or world.predicates is None:
+        return None
+    return sum(1 for c in world.goal_conditions if c in world.predicates)
+
+
+class StagnationRule(Rule):
+    """No new goal condition became true for `window` steps while agents are working.
+
+    Complements idle_deadlock (everyone idle): here agents may be busy but nothing
+    gets done. Mostly a trigger for the LLM to review the situation.
+    """
+    name = "stagnation"
+
+    def __init__(self, window: int = 500, **params):
+        super().__init__(**params)
+        self.window = int(window)
+        self.reset()
+
+    def reset(self):
+        self._best = None
+        self._since = 0
+
+    def on_event(self, event, world):
+        if event.type != ev.STATE_SNAPSHOT or world.goal_satisfied() is not False:
+            return []
+        prog = _goal_progress(world)
+        if prog is None:
+            return []
+        if self._best is None or prog > self._best:
+            self._best, self._since = prog, event.step
+            return []
+        if event.step - self._since < self.window:
+            return []
+        self._since = event.step  # at most once per window
+        unmet = world.unmet_goal_conditions()
+        return [Finding(rule=self.name, phase="async", step=event.step, agent_id=a,
+                        message=(f"No goal condition has been achieved in the last {self.window} "
+                                 f"steps. Unmet goal conditions: {unmet}. Check whether your current "
+                                 f"approach is working."),
+                        evidence={"window": self.window, "progress": prog, "unmet": unmet})
+                for a in world.agents]
+
+
+def _cond_pred(cond: str) -> str:
+    return cond.split("(", 1)[0].strip()
+
+
+def _cond_entities(cond: str) -> List[str]:
+    inner = cond[cond.find("(") + 1: cond.rfind(")")] if "(" in cond else ""
+    return [x.strip() for x in inner.split(",") if x.strip()]
+
+
+def _achievers(agent, pred: str) -> List[Any]:
+    """Actions of `agent` whose `post` can make predicate `pred` true."""
+    out = []
+    for spec in agent.action_space.values():
+        for c in spec.semantics.get("post") or []:
+            if c.replace(" ", "").startswith(f"pred({pred},"):
+                out.append(spec)
+    return out
+
+
+class WorkloadRiskRule(Rule):
+    """Assist: the remaining work cannot be finished in time by the agents doing it,
+    while a capable teammate is idle.
+
+    Generic estimate: a goal condition is *owned* by the agent that most recently
+    acted on one of its entities; unowned unmet conditions are assumed to fall to the
+    busy agents. Cost per condition = observed steps per achieved condition in this
+    episode, else `prior_steps_per_condition`. Needs `max_steps` (episode budget)
+    from the adapter; silent otherwise. A helper must be idle, able to achieve the
+    condition's predicate (an action whose `post` produces it, with `requires`
+    covered by its tags) and must not have failed on those entities before.
+    """
+    name = "workload_risk"
+
+    def __init__(self, prior_steps_per_condition: int = 400, margin: float = 1.0, **params):
+        super().__init__(**params)
+        self.prior = int(prior_steps_per_condition)
+        self.margin = float(margin)
+        self.reset()
+
+    def reset(self):
+        self._sent = set()
+        self._initial: Optional[set] = None  # goal conditions already true at the start
+
+    def _cost(self, world: WorldState) -> float:
+        done = [c for c in (world.goal_conditions or [])
+                if c in (world.predicates or set()) and c not in (self._initial or set())]
+        if done and world.step > 0:
+            return world.step / len(done)  # includes travel: a pessimistic rate
+        return float(self.prior)
+
+    def _owner(self, world: WorldState, cond: str) -> Optional[str]:
+        ents = set(_cond_entities(cond))
+        for aid in reversed(world.action_order):
+            a = world.actions[aid]
+            if a.status == "rejected":
+                continue
+            if ents & set(_entities_in(a.args)):
+                return a.agent_id
+        return None
+
+    @staticmethod
+    def _failed_on_cond(world: WorldState, agent_id: str, cond: str) -> bool:
+        ents = set(_cond_entities(cond))
+        return any(a.outcome == "failure" and ents & set(_entities_in(a.args))
+                   for a in world.agent_actions(agent_id))
+
+    def _can_achieve(self, agent, cond: str, world: WorldState) -> bool:
+        specs = _achievers(agent, _cond_pred(cond))
+        if not specs:
+            return False
+        ok = False
+        for spec in specs:
+            need = spec.semantics.get("requires") or []
+            if need and (agent.capability_tags is None
+                         or any(t not in agent.capability_tags for t in need)):
+                continue
+            ok = True
+        if not ok:
+            return False
+        ents = set(_cond_entities(cond))
+        for a in world.agent_actions(agent.agent_id):
+            if a.outcome == "failure" and ents & set(_entities_in(a.args)):
+                return False
+        return True
+
+    def on_event(self, event, world):
+        # snapshots (periodic) and action starts: right after an action.ended snapshot
+        # the agent that just finished looks idle, so starts are checked as well
+        if event.type not in (ev.STATE_SNAPSHOT, ev.ACTION_STARTED):
+            return []
+        if self._initial is None:
+            if event.type != ev.STATE_SNAPSHOT:
+                return []
+            self._initial = {c for c in (world.goal_conditions or [])
+                             if c in (world.predicates or set())}
+        if not world.max_steps or world.goal_satisfied() is not False:
+            return []
+        if any(not world.agent_actions(a) for a in world.agents):
+            return []  # someone has not started yet: "idle" is not meaningful
+        idle = [a for a in world.agents.values() if _is_idle(a, world)]
+        busy = [a for a in world.agents.values() if not _is_idle(a, world)]
+        if not idle or not busy:
+            return []
+        unmet = world.unmet_goal_conditions()
+        # goal conditions about "nobody holds anything" etc. have no entity to hand over
+        unmet = [c for c in unmet if any(e in world.entities and world.entities[e].type
+                                         != "robot_entity_type" for e in _cond_entities(c))]
+        if not unmet:
+            return []
+        owner = {c: self._owner(world, c) for c in unmet}
+        # memory: an owner that already failed on the condition's entities is "blocked"
+        blocked = [c for c in unmet if owner[c] is not None
+                   and self._failed_on_cond(world, owner[c], c)]
+        busy_ids = {a.agent_id for a in busy}
+        load = {a: 0 for a in busy_ids}
+        free = []  # handover candidates: unowned, or owned by a busy agent but not being worked on now
+        for c in unmet:
+            o = owner[c]
+            if c in blocked:
+                continue
+            if o in busy_ids:
+                load[o] += 1
+            elif o is None:
+                free.append(c)
+        n_free_share = len(free) / max(1, len(busy_ids))
+        cost = self._cost(world)
+        remaining = world.max_steps - world.step
+        at_risk = {a: (load[a] + n_free_share) * cost for a in busy_ids}
+        time_risk = max(at_risk.values()) * self.margin > remaining
+        if not time_risk and not blocked:
+            return []
+        # candidate conditions: blocked ones (owner failed) first; with time risk also unowned
+        # ones and owned-but-not-current ones of the busy agents
+        current_ents = set()
+        for a in busy:
+            rec = world.actions.get(a.current_action) if a.current_action else None
+            if rec:
+                current_ents |= set(_entities_in(rec.args))
+        cands = list(blocked)
+        if time_risk:
+            cands += free + [c for c in unmet if owner[c] in busy_ids and c not in blocked
+                             and not set(_cond_entities(c)) & current_ents]
+        out = []
+        for helper in idle:
+            for c in cands:
+                if (helper.agent_id, c) in self._sent or not self._can_achieve(helper, c, world):
+                    continue
+                self._sent.add((helper.agent_id, c))
+                o = owner[c]
+                if c in blocked:
+                    who = f"{o} already failed on it, and"
+                else:
+                    who = f"{o} is responsible for it but" if o else "nobody is working on it and"
+                head = (f"Time is running out: {remaining} steps left, and the remaining work "
+                         f"(~{int(max(at_risk.values()))} steps) is on {sorted(busy_ids)} while you "
+                         f"are idle. ") if time_risk else "You are idle. "
+                out.append(Finding(
+                    rule=self.name, phase="async", step=event.step, agent_id=helper.agent_id,
+                    message=(head + f"Goal condition '{c}' is unmet; {who} you could achieve it. "
+                             f"Consider taking it over and tell your teammates."),
+                    evidence={"condition": c, "owner": o, "remaining_steps": remaining,
+                              "estimate": at_risk, "cost_per_condition": cost,
+                              "blocked_owner": c in blocked}))
+                if o:
+                    out.append(Finding(
+                        rule=self.name, phase="async", step=event.step, agent_id=o,
+                        message=((f"{helper.agent_id} was asked to take over '{c}' because your "
+                                  f"attempt failed; do not retry it unless {helper.agent_id} "
+                                  f"reports a problem.") if c in blocked else
+                                 (f"{helper.agent_id} is idle and was asked to take over '{c}' to "
+                                  f"meet the time limit. Focus on your other conditions unless "
+                                  f"{helper.agent_id} reports a problem.")),
+                        evidence={"condition": c, "helper": helper.agent_id,
+                                  "blocked_owner": c in blocked}, interrupt=False))
+                break  # one suggestion per helper per check
+        return out
+
+
 RULES: Dict[str, Type[Rule]] = {r.name: r for r in [
     UnknownActionRule, UnknownEntityRule, CapabilityRule, PreconditionRule,
     OutcomeFailureRule, RepeatFailureRule, IdleDeadlockRule,
-    StalledActionRule, HelpRoutingRule,
+    StalledActionRule, HelpRoutingRule, RepeatedDenialRule, StagnationRule, WorkloadRiskRule,
 ]}
 
 

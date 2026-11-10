@@ -5,12 +5,15 @@
 # used by the replay mock to enrich traces recorded before that (schema 0.1 traces
 # without `semantics` / `capability_tags` / `goal.conditions`).
 
+# Episode step budget (EMOS environment.max_episode_steps); older traces lack it.
+max_steps: 750
+
 action_space:
   - name: nav_to_obj
     params: {target_obj: entity_id}
     semantics:
       post: ["pred(robot_at, args.target_obj, agent.id)"]
-      max_steps: 300          # stalled_action; normal runs take <= ~190 steps
+      max_steps: 200          # stalled_action; normal runs take <= ~190 steps
   - name: pick
     params: {target_obj: entity_id}
     semantics:

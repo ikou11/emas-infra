@@ -13,5 +13,8 @@ dependencies = [
     "pyyaml>=5.4",
 ]
 
+[project.optional-dependencies]
+llm = ["openai>=1.0"]   # supervisor LLM (credentials in .env, see .env.example)
+
 [tool.setuptools.packages.find]
 include = ["embodied_infra*"]
